@@ -1,0 +1,18 @@
+# Go binaries and build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+
+# OS and IDE configuration files
+.DS_Store
+.vscode/
+.idea/
+
+# Ignore all markdown documentation files except README.md
+*.md
+!README.md
