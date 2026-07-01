@@ -5,13 +5,21 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"sync/atomic"
 	// "errors"
 )
+
+var activeCommands atomic.Int32
 
 func main() {
 	//initialize the scanner to look for input
 	scanner := bufio.NewScanner(os.Stdin)
+	sigchan := make(chan os.Signal, 1)
+	signal.Notify(sigchan, os.Interrupt)
+	go checksignal(sigchan)
+
 	for {
 		fmt.Print("tish>")
 		//fetch the input
@@ -31,9 +39,16 @@ func main() {
 // parseline parses the input into command and args and
 // call the commands if built-in or call the execute helper
 func parseline(line string) (int, error) {
+	isBackground := false
+	if strings.HasSuffix(line, "&") {
+		isBackground = true
+		line = strings.TrimSuffix(line, "&")
+		line = strings.TrimSpace(line)
+	}
 	cmdStrings := strings.Split(line, "|")
+	fields := strings.Fields(line)
+
 	if len(cmdStrings) == 1 {
-		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			return 1, nil
 		}
@@ -50,14 +65,14 @@ func parseline(line string) (int, error) {
 
 		} else {
 			// Call execute to run external commands
-			err := execute(function, args)
+			err := execute(function, args, isBackground)
 			if err != nil {
 				return 1, err
 			}
 		}
 		return 1, nil
 	} else {
-		err := executePipeline(cmdStrings)
+		err := executePipeline(cmdStrings, isBackground)
 		if err != nil {
 			return 1, err
 		}
@@ -103,7 +118,7 @@ func parseredirection(args []string) (cleaned []string, stdinFile string, stdout
 	}
 	return cleaned, stdinFile, stdoutFile, appendStdout, err
 }
-func executePipeline(cmdStrings []string) (err error) {
+func executePipeline(cmdStrings []string, isBackground bool) (err error) {
 	//Keep track of all spawned commands to wait for them at the end
 	cmds := []*exec.Cmd{}
 	var prevReader *os.File
@@ -160,6 +175,10 @@ func executePipeline(cmdStrings []string) (err error) {
 		if err != nil {
 			return err
 		}
+		if !isBackground {
+			activeCommands.Add(1)
+			defer activeCommands.Add(-1)
+		}
 		if i < len(cmdStrings)-1 {
 			cmd.Stdout.(*os.File).Close()
 		}
@@ -169,18 +188,34 @@ func executePipeline(cmdStrings []string) (err error) {
 		prevReader = nextReader
 		cmds = append(cmds, cmd)
 	}
-	for i := 0; i < len(cmds); i++ {
-		err := cmds[i].Wait()
-		if err != nil {
-			fmt.Println("Command failed:", err)
-			return err
+	if isBackground {
+		go func() {
+			for i := 0; i < len(cmds); i++ {
+				err := cmds[i].Wait()
+				if err != nil {
+					fmt.Println("\n[Background pipeline failed:", err, "]")
+					fmt.Print("tish>")
+					return
+				}
+			}
+			fmt.Println("\n[Background pipeline finished]")
+			fmt.Print("tish>")
+			return
+		}()
+	} else {
+		for i := 0; i < len(cmds); i++ {
+			err := cmds[i].Wait()
+			if err != nil {
+				fmt.Println("Command failed:", err)
+				return err
+			}
 		}
 	}
 
 	return nil
 }
 
-func execute(function string, args []string) error {
+func execute(function string, args []string, isBackground bool) error {
 
 	cleaned, stdinFile, stdoutFile, appendStdout, err := parseredirection(args)
 	if err != nil {
@@ -189,6 +224,11 @@ func execute(function string, args []string) error {
 	//tie input,output and error streams of current parent process and child
 	//which is forked when we use cmd.Run() or cmd.Start() under the hood
 	cmd := exec.Command(function, cleaned...)
+	if !isBackground {
+		activeCommands.Add(1)
+		defer activeCommands.Add(-1)
+	}
+
 	if stdinFile != "" {
 		file, err := os.Open(stdinFile)
 		if err != nil {
@@ -216,6 +256,27 @@ func execute(function string, args []string) error {
 		cmd.Stdout = os.Stdout
 	}
 	cmd.Stderr = os.Stderr
+
+	if isBackground {
+		err = cmd.Start()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("[1] %d\n", cmd.Process.Pid)
+
+		go func() {
+			err := cmd.Wait()
+			if err != nil {
+				fmt.Printf("\n[Background process %d finished with error: %v]\n", cmd.Process.Pid, err)
+			} else {
+				fmt.Printf("\n[Background process %d finished]\n", cmd.Process.Pid)
+			}
+			fmt.Print("tish>")
+		}()
+		return nil
+
+	}
+
 	return cmd.Run()
 
 }
@@ -231,4 +292,12 @@ func cd(args []string) error {
 		}
 	}
 	return nil
+}
+
+func checksignal(sigchan chan os.Signal) {
+	for range sigchan {
+		if activeCommands.Load() == 0 {
+			fmt.Print("\ntish>")
+		}
+	}
 }
