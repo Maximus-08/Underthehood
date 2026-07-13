@@ -10,17 +10,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
-	// "errors"
 )
 
 var activeCommands atomic.Int32
-var jobs map[int]*exec.Cmd
-var jobsMu sync.Mutex
-var jobsCond *sync.Cond
 
 func main() {
-	jobs = make(map[int]*exec.Cmd)
-	jobsCond = sync.NewCond(&jobsMu)
+	jm := NewJobManager()
 	//initialize the scanner to look for input
 	scanner := bufio.NewScanner(os.Stdin)
 	//Make a buffered channel to catch the SIGINT/ Ctrl+C.
@@ -36,7 +31,7 @@ func main() {
 			break
 		}
 		line := scanner.Text()
-		status, err := parseline(line)
+		status, err := parseline(jm, line)
 		if err != nil {
 			fmt.Println(err)
 		}
@@ -45,6 +40,26 @@ func main() {
 		}
 
 	}
+}
+
+type JobManager struct {
+	jobs map[int]*exec.Cmd
+	mu   sync.Mutex
+	cond *sync.Cond
+}
+
+func NewJobManager() *JobManager {
+	jm := &JobManager{
+		jobs: make(map[int]*exec.Cmd),
+	}
+	jm.cond = sync.NewCond(&jm.mu)
+	return jm
+}
+
+func (jm *JobManager) Add(pid int, cmd *exec.Cmd) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	jm.jobs[pid] = cmd
 }
 
 type command struct {
@@ -258,7 +273,7 @@ func parse(tokens []token) (pipeline, error) {
 	return cmdPipeline, nil
 }
 
-func parseline(line string) (int, error) {
+func parseline(jm *JobManager, line string) (int, error) {
 	tokens, err := tokenize(line)
 	if err != nil {
 		return 1, err
@@ -267,11 +282,11 @@ func parseline(line string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	status, err := executePipeline(p)
+	status, err := executePipeline(jm, p)
 	return status, err
 }
 
-func executePipeline(p pipeline) (status int, err error) {
+func executePipeline(jm *JobManager, p pipeline) (status int, err error) {
 	//Keep track of all spawned commands to wait for them at the end
 	if len(p.cmds) == 1 {
 		switch p.cmds[0].cmd {
@@ -280,9 +295,9 @@ func executePipeline(p pipeline) (status int, err error) {
 		case "cd":
 			return cd(p.cmds[0].args)
 		case "jobs":
-			return printJobs()
+			return printJobs(jm)
 		case "wait":
-			return wait()
+			return wait(jm)
 		case "export":
 			return export(p.cmds[0].args)
 		}
@@ -360,10 +375,7 @@ func executePipeline(p pipeline) (status int, err error) {
 		prevReader = nextReader
 		if p.isBackground {
 			pid := comd.Process.Pid
-			jobsMu.Lock()
-			jobs[pid] = comd
-			fmt.Printf("[%d]%d\n", i, pid)
-			jobsMu.Unlock()
+			jm.Add(pid, comd)
 		} else {
 			activeCommands.Add(1)
 			defer activeCommands.Add(-1)
@@ -379,10 +391,10 @@ func executePipeline(p pipeline) (status int, err error) {
 			for _, c := range cms {
 				c.Wait()
 				pid := c.Process.Pid
-				jobsMu.Lock()
-				delete(jobs, pid)
-				jobsCond.Broadcast()
-				jobsMu.Unlock()
+				jm.mu.Lock()
+				delete(jm.jobs, pid)
+				jm.cond.Broadcast()
+				jm.mu.Unlock()
 			}
 		}()
 	}
@@ -402,10 +414,10 @@ func cd(args []string) (int, error) {
 	return 1, nil
 }
 
-func printJobs() (int, error) {
-	jobsMu.Lock()
-	defer jobsMu.Unlock()
-	for key := range jobs {
+func printJobs(jm *JobManager) (int, error) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	for key := range jm.jobs {
 		fmt.Println(key)
 	}
 	return 1, nil
@@ -420,11 +432,11 @@ func export(arg []string) (int, error) {
 	}
 	return 1, os.Setenv(key, value)
 }
-func wait() (int, error) {
-	jobsMu.Lock()
-	defer jobsMu.Unlock()
-	for len(jobs) > 0 {
-		jobsCond.Wait()
+func wait(jm *JobManager) (int, error) {
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	for len(jm.jobs) > 0 {
+		jm.cond.Wait()
 	}
 	return 1, nil
 }
