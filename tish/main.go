@@ -15,8 +15,9 @@ import (
 var activeCommands atomic.Int32
 
 func main() {
+	//Initialize new job manager object
 	jm := NewJobManager()
-	//initialize the scanner to look for input
+	//initialize the scanner to look for input (stdin/terminal)
 	scanner := bufio.NewScanner(os.Stdin)
 	//Make a buffered channel to catch the SIGINT/ Ctrl+C.
 	//Notify catches the signal and puts it in the channel
@@ -42,6 +43,8 @@ func main() {
 	}
 }
 
+// Jobmanager struct encapsulates jobs map,its Mutex and
+// the Condition needed for Wait()
 type JobManager struct {
 	jobs map[int]*exec.Cmd
 	mu   sync.Mutex
@@ -51,8 +54,9 @@ type JobManager struct {
 func NewJobManager() *JobManager {
 	jm := &JobManager{
 		jobs: make(map[int]*exec.Cmd),
+		//Mutex does not need initialization
 	}
-	jm.cond = sync.NewCond(&jm.mu)
+	jm.cond = sync.NewCond(&jm.mu) //Cond requires pointer to a Locker(Mutex/RW Mutex)
 	return jm
 }
 
@@ -78,7 +82,7 @@ type pipeline struct {
 type tokenType int
 
 const (
-	tokenWord tokenType = iota
+	tokenWord tokenType = iota //In 1 const block iota keeps incrementing
 	tokenPipe
 	tokenRedirectIn
 	tokenRedirectOut
@@ -91,11 +95,12 @@ type token struct {
 	value string
 }
 
+// Tokenize the input
 func tokenize(line string) ([]token, error) {
 	runes := []rune(line)
 	var isSingleQuote bool
 	var isDoubleQuote bool
-	var currentToken strings.Builder
+	var currentToken strings.Builder //string.builder more efficient than appending to a string
 	var tokens []token
 	flushWord := func() {
 		if currentToken.Len() > 0 {
@@ -205,6 +210,7 @@ func tokenize(line string) ([]token, error) {
 	return tokens, nil
 }
 
+// Parse tokens slice into the pipeline of commands
 func parse(tokens []token) (pipeline, error) {
 	cmdPipeline := pipeline{}
 	if len(tokens) == 0 {
@@ -220,7 +226,8 @@ func parse(tokens []token) (pipeline, error) {
 	j := 0
 	cmdPipeline.cmds = append(cmdPipeline.cmds, command{})
 	for i := 0; i < len(tokens); i++ {
-		if tokens[i].kind == tokenWord {
+		switch tokens[i].kind {
+		case tokenWord:
 			if strings.Contains(tokens[i].value, "=") && cmdPipeline.cmds[j].cmd == "" {
 				cmdPipeline.cmds[j].env = append(cmdPipeline.cmds[j].env, tokens[i].value)
 			} else if cmdPipeline.cmds[j].cmd == "" {
@@ -228,10 +235,8 @@ func parse(tokens []token) (pipeline, error) {
 			} else {
 				cmdPipeline.cmds[j].args = append(cmdPipeline.cmds[j].args, tokens[i].value)
 			}
-		} else if tokens[i].kind == tokenPipe {
-			if i == 0 {
-				return pipeline{}, fmt.Errorf("Invalid pipe")
-			} else if i == len(tokens)-1 {
+		case tokenPipe:
+			if i == len(tokens)-1 {
 				return pipeline{}, fmt.Errorf("Invalid pipe")
 			} else if tokens[i+1].kind != tokenPipe {
 				cmdPipeline.cmds = append(cmdPipeline.cmds, command{})
@@ -239,23 +244,23 @@ func parse(tokens []token) (pipeline, error) {
 			} else {
 				return pipeline{}, fmt.Errorf("Invalid pipe")
 			}
-		} else if tokens[i].kind == tokenBackground {
+		case tokenBackground:
 			return pipeline{}, fmt.Errorf("Invalid background token")
-		} else if tokens[i].kind == tokenRedirectIn {
+		case tokenRedirectIn:
 			if i == len(tokens)-1 || tokens[i+1].kind != tokenWord {
 				return pipeline{}, fmt.Errorf("Missing filename")
 			} else {
 				cmdPipeline.cmds[j].stdinFile = tokens[i+1].value
 				i++
 			}
-		} else if tokens[i].kind == tokenRedirectOut {
+		case tokenRedirectOut:
 			if i == len(tokens)-1 || tokens[i+1].kind != tokenWord {
 				return pipeline{}, fmt.Errorf("Missing filename")
 			} else {
 				cmdPipeline.cmds[j].stdoutFile = tokens[i+1].value
 				i++
 			}
-		} else if tokens[i].kind == tokenRedirectAppend {
+		case tokenRedirectAppend:
 			if i == len(tokens)-1 || tokens[i+1].kind != tokenWord {
 				return pipeline{}, fmt.Errorf("Missing filename")
 			} else {
@@ -304,7 +309,7 @@ func executePipeline(jm *JobManager, p pipeline) (status int, err error) {
 	}
 	var firstPid int
 	var prevReader *os.File
-	var cms []*exec.Cmd
+	var cms []*exec.Cmd //commands slice to use for waiting on foreground processes.
 	for i, c := range p.cmds {
 
 		inFile := c.stdinFile
@@ -312,7 +317,7 @@ func executePipeline(jm *JobManager, p pipeline) (status int, err error) {
 		appendStdout := c.isAppend
 		comd := exec.Command(c.cmd, c.args...)
 		if len(c.env) > 0 {
-			comd.Env = append(os.Environ(), c.env...)
+			comd.Env = append(os.Environ(), c.env...) //os.Environ is the env of parent shell process
 		}
 
 		if inFile != "" {
@@ -321,21 +326,13 @@ func executePipeline(jm *JobManager, p pipeline) (status int, err error) {
 				return 1, err
 			}
 			comd.Stdin = file
-			defer file.Close() //Maybe need to close at the end of the loop
 		} else if prevReader != nil {
 			comd.Stdin = prevReader
 		} else {
 			comd.Stdin = os.Stdin
 		}
 		var nextReader *os.File
-		if i < len(p.cmds)-1 {
-			r, w, err := os.Pipe()
-			if err != nil {
-				return 1, err
-			}
-			nextReader = r
-			comd.Stdout = w
-		} else if outFile != "" {
+		if outFile != "" {
 			var file *os.File
 			var err error
 			if appendStdout {
@@ -347,11 +344,26 @@ func executePipeline(jm *JobManager, p pipeline) (status int, err error) {
 				return 1, err
 			}
 			comd.Stdout = file
-			defer file.Close()
+			if i < len(p.cmds)-1 {
+				r, w, err := os.Pipe()
+				if err != nil {
+					return 1, err
+				}
+				w.Close()
+				nextReader = r
+			}
+		} else if i < len(p.cmds)-1 {
+			r, w, err := os.Pipe()
+			if err != nil {
+				return 1, err
+			}
+			nextReader = r
+			comd.Stdout = w
 		} else {
 			comd.Stdout = os.Stdout
 		}
 		comd.Stderr = os.Stderr
+		// Set process group for background processes so they don't get interrupted with Ctrl+C in the
 		if p.isBackground {
 			if i == 0 {
 				comd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -363,10 +375,18 @@ func executePipeline(jm *JobManager, p pipeline) (status int, err error) {
 		if err != nil {
 			return 1, err
 		}
+		//Close input redirection file if opened
+		if f, ok := comd.Stdin.(*os.File); ok && inFile != "" {
+			f.Close()
+		}
+		//Close output redirection file if opened
+		if f, ok := comd.Stdout.(*os.File); ok && outFile != "" {
+			f.Close()
+		}
 		if p.isBackground && i == 0 {
 			firstPid = comd.Process.Pid
 		}
-		if i < len(p.cmds)-1 {
+		if i < len(p.cmds)-1 && outFile == "" {
 			comd.Stdout.(*os.File).Close()
 		}
 		if prevReader != nil {
@@ -442,8 +462,7 @@ func wait(jm *JobManager) (int, error) {
 }
 
 // Checks if any child processes is active with the activeCommands counter
-//
-//	if not only the parent shell is active
+// if not only the parent shell is active
 func checksignal(sigchan chan os.Signal) {
 	for range sigchan {
 		if activeCommands.Load() == 0 {
