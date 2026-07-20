@@ -19,6 +19,10 @@ func main() {
 	jm := NewJobManager()
 	//initialize the scanner to look for input (stdin/terminal)
 	scanner := bufio.NewScanner(os.Stdin)
+	if scanner.Err() != nil {
+		fmt.Printf(scanner.Err().Error())
+		return
+	}
 	//Make a buffered channel to catch the SIGINT/ Ctrl+C.
 	//Notify catches the signal and puts it in the channel
 	sigchan := make(chan os.Signal, 1)
